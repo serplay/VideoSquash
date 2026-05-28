@@ -1,6 +1,17 @@
 import os
 import asyncio
 import json
+import logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Constants
+BITS_PER_MB = 8 * 1024 * 1024
+BITRATE_SAFETY_FACTOR = 0.95
+DEFAULT_AUDIO_BITRATE_BPS = 128000
+
+from models import Job, VideoOptions
 
 async def get_video_duration(input_file: str) -> float:
     """Uses ffprobe to extract the exact duration of the video in seconds."""
@@ -20,100 +31,145 @@ async def get_video_duration(input_file: str) -> float:
         raise Exception(f"ffprobe error: {stderr.decode()}")
     return float(stdout.decode().strip())
 
-async def process_video(
-    input_file: str, 
-    output_file: str, 
-    target_size_mb: float, 
-    mute: bool = False, 
-    crop: str = None,
-    start_time: float = 0.0,
-    end_time: float = 0.0,
-    job_info: dict = None
-):
-    """
-    Compresses video to target size, optionally muting and cropping.
-    `job_info` dict can be updated to track progress (e.g. status='processing').
-    """
+async def get_video_resolution(input_file: str) -> tuple[int, int]:
+    """Uses ffprobe to extract the width and height of the video."""
+    cmd = [
+        'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height', '-of',
+        'json', input_file
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    
+    if process.returncode != 0:
+        raise Exception(f"ffprobe error: {stderr.decode()}")
+    
+    data = json.loads(stdout.decode())
+    streams = data.get('streams', [])
+    if not streams:
+        raise Exception("No video streams found in the input file.")
+    
+    return int(streams[0].get('width', 0)), int(streams[0].get('height', 0))
+
+def _calculate_bitrate(input_file: str, duration: float, target_size_mb: float, mute: bool) -> int:
+    """Internal helper to calculate the target video bitrate in kbps."""
     input_size_bytes = os.path.getsize(input_file)
     input_size_mb = input_size_bytes / (1024 * 1024)
     
-    if target_size_mb > input_size_mb:
-        target_size_mb = input_size_mb
-        
-    target_size_bits = target_size_mb * 8388608
+    effective_target_mb = min(target_size_mb, input_size_mb)
+    target_size_bits = effective_target_mb * BITS_PER_MB
     
-    total_duration = await get_video_duration(input_file)
-    if end_time > 0 and end_time > start_time:
-        duration = min(end_time - start_time, total_duration - start_time)
-    else:
-        duration = total_duration
-        
-    safe_total_bitrate = (target_size_bits / duration) * 0.95
-    audio_bitrate_bps = 128000 if not mute else 0
+    safe_total_bitrate = (target_size_bits / duration) * BITRATE_SAFETY_FACTOR
+    audio_bitrate_bps = 0 if mute else DEFAULT_AUDIO_BITRATE_BPS
     video_bitrate_bps = safe_total_bitrate - audio_bitrate_bps
     
     if video_bitrate_bps <= 0:
         raise Exception("Target size is too small to compress this video even at minimum quality.")
         
-    video_bitrate_kbps = int(video_bitrate_bps / 1000)
-    
-    # Construct base ffmpeg video filter if cropping is needed
-    # Crop expects something like 'crop=ih*16/9:ih' for 16:9, etc.
-    vf_args = []
-    if crop and crop != 'none':
-        # E.g., crop could be '1:1', '16:9', '9:16'
-        w, h = crop.split(':')
-        vf_args = ['-vf', f'crop=ih*{w}/{h}:ih'] # basic center crop depending on orientation
-        # Let's use standard ffmpeg crop syntax for center crop of given aspect ratio:
-        # crop=iw:iw/ratio if wide, else...
-        # A simpler way to force aspect ratio and crop is: 'crop=in_w:in_w/{crop_ratio}' but it depends on original aspect.
-        # Actually, let's just use: f'crop=ih*({w}/{h}):ih' if w < h or similar.
-        # Let's use a safe robust crop filter that maximizes the area for the target aspect ratio:
-        # crop=ih*({w}/{h}):ih (if landscape to portrait) etc.
-        # Better yet, FFmpeg has a way to crop exactly to aspect ratio while centering:
-        # crop=iw:iw/(16/9) if iw/(16/9) <= ih, else ih*(16/9):ih
-        # To avoid complex expressions, let's let FFmpeg evaluate it:
-        # 'crop=iw:iw/(W/H)' ... wait, expression parsing in FFmpeg:
-        ratio = f"({w}/{h})"
-        vf_expr = f"crop=if(lt(a,{ratio}),iw,ih*{ratio}):if(lt(a,{ratio}),iw/{ratio},ih)"
-        vf_args = ['-vf', vf_expr]
+    return int(video_bitrate_bps / 1000)
+
+async def _build_video_filters(input_file: str, options: VideoOptions) -> list:
+    """Internal helper to construct the ffmpeg video filters."""
+    vf_filters = []
+    if options.crop and options.crop != 'none':
+        try:
+            w, h = options.crop.split(':')
+            ratio = f"({w}/{h})"
+            vf_filters.append(f"crop=if(lt(a,{ratio}),iw,ih*{ratio}):if(lt(a,{ratio}),iw/{ratio},ih)")
+        except ValueError:
+            logger.error(f"Invalid crop format: {options.crop}")
         
-    # --- Pass 1 ---
-    if job_info:
-        job_info['status'] = 'pass_1'
-        
-    input_args = []
-    if end_time > 0 and end_time > start_time:
-        input_args.extend(['-ss', str(start_time), '-to', str(end_time)])
-        
-    pass1_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
-        '-c:v', 'libx264', '-b:v', f'{video_bitrate_kbps}k',
-        '-pass', '1'
-    ]
-    if mute:
-        pass1_cmd.append('-an')
-    else:
-        pass1_cmd.append('-an') # pass 1 doesn't need audio anyway
-        
-    pass1_cmd.extend(vf_args)
-    pass1_cmd.extend(['-f', 'mp4', os.devnull])
-    
-    p1 = await asyncio.create_subprocess_exec(
-        *pass1_cmd,
+    if options.target_resolution and options.target_resolution != 'original':
+        try:
+            target_h = int(options.target_resolution)
+            _, input_h = await get_video_resolution(input_file)
+            if target_h < input_h:
+                vf_filters.append(f"scale=-2:{target_h}")
+        except Exception:
+            logger.exception("Failed to check resolution or scale")
+            
+    return ['-vf', ','.join(vf_filters)] if vf_filters else []
+
+async def _run_ffmpeg_pass(cmd: list, pass_num: int):
+    """Internal helper to execute an ffmpeg pass."""
+    logger.info(f"Starting ffmpeg pass {pass_num}")
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
-    await p1.communicate()
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        logger.error(f"ffmpeg pass {pass_num} failed: {stderr.decode()}")
+        raise Exception(f"ffmpeg pass {pass_num} error")
+
+async def process_video(job: Job):
+    """
+    Compresses video to target size, optionally muting, cropping, and scaling resolution.
+    Uses information from the provided Job object and updates its status.
+    """
+    input_file = job.input_file
+    output_file = job.output_file
+    options = job.options
+    job_id = job.job_id
+    
+    pass_log_prefix = os.path.join(os.path.dirname(output_file), f"ffmpeg2pass_{job_id}")
+
+    total_duration = await get_video_duration(input_file)
+    if options.end_time > 0 and options.end_time > options.start_time:
+        duration = min(options.end_time - options.start_time, total_duration - options.start_time)
+    else:
+        duration = total_duration
+
+    video_bitrate_kbps = _calculate_bitrate(input_file, duration, options.target_size_mb, options.mute)
+    vf_args = await _build_video_filters(input_file, options)
+    
+    input_args = []
+    if options.end_time > 0 and options.end_time > options.start_time:
+        input_args.extend(['-ss', str(options.start_time), '-to', str(options.end_time)])
+
+    # Determine encoder and profile options
+    use_nvenc = os.getenv("USE_NVENC", "true").lower() == "true"
+    video_codec = "h264_nvenc" if use_nvenc else "libx264"
+    logger.info(f"Attempting to use video codec: {video_codec} (USE_NVENC={use_nvenc})")
+
+    # Extra parameters for maximum compatibility
+    compatibility_args = ['-pix_fmt', 'yuv420p', '-profile:v', 'high']
+        
+    # --- Pass 1 ---
+    job.status = 'pass_1'
+        
+    pass1_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
+        '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
+        '-pass', '1', '-passlogfile', pass_log_prefix, '-an'
+    ] + compatibility_args + vf_args + ['-f', 'mp4', os.devnull]
+    
+    try:
+        await _run_ffmpeg_pass(pass1_cmd, 1)
+    except Exception as e:
+        if use_nvenc and video_codec == "h264_nvenc":
+            logger.warning("ffmpeg pass 1 failed with h264_nvenc. Falling back to CPU (libx264)...")
+            video_codec = "libx264"
+            pass1_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
+                '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
+                '-pass', '1', '-passlogfile', pass_log_prefix, '-an'
+            ] + compatibility_args + vf_args + ['-f', 'mp4', os.devnull]
+            await _run_ffmpeg_pass(pass1_cmd, 1)
+        else:
+            raise
     
     # --- Pass 2 ---
-    if job_info:
-        job_info['status'] = 'pass_2'
+    job.status = 'pass_2'
         
     pass2_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
-        '-c:v', 'libx264', '-b:v', f'{video_bitrate_kbps}k',
-        '-pass', '2'
-    ]
-    if mute:
+        '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
+        '-pass', '2', '-passlogfile', pass_log_prefix
+    ] + compatibility_args
+    if options.mute:
         pass2_cmd.append('-an')
     else:
         pass2_cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
@@ -121,14 +177,13 @@ async def process_video(
     pass2_cmd.extend(vf_args)
     pass2_cmd.append(output_file)
     
-    p2 = await asyncio.create_subprocess_exec(
-        *pass2_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    await p2.communicate()
+    await _run_ffmpeg_pass(pass2_cmd, 2)
     
     # Cleanup log files
-    for log in ['ffmpeg2pass-0.log', 'ffmpeg2pass-0.log.mbtree']:
-        if os.path.exists(log):
-            os.remove(log)
+    for suffix in ['-0.log', '-0.log.mbtree']:
+        log_file = f"{pass_log_prefix}{suffix}"
+        if os.path.exists(log_file):
+            os.remove(log_file)
+
+
+

@@ -2,16 +2,38 @@ import os
 import uuid
 import asyncio
 import time
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from queue_manager import job_queue, jobs_db, start_workers
+from models import Job, VideoOptions
+
+# Configure logging centrally
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Start queue workers and cleanup task
+    app.state.workers = await start_workers()
+    cleanup_task = asyncio.create_task(cleanup_old_files())
+    logger.info("Application started: workers and cleanup task initialized.")
+    yield
+    # Shutdown: Clean up resources if needed
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("Application shutdown: cleanup task cancelled.")
 
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -26,30 +48,53 @@ app.add_middleware(
 
 UPLOAD_DIR = "uploads"
 PROCESSED_DIR = "processed"
-MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
+# File size limits and intervals
+GB = 1024 * 1024 * 1024
+MAX_UPLOAD_SIZE = 2.5 * GB
+CLEANUP_INTERVAL_SEC = 600
+FILE_EXPIRY_SEC = 3600
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-# Startup event to start queue workers and cleanup task
-@app.on_event("startup")
-async def startup_event():
-    app.state.workers = await start_workers()
-    asyncio.create_task(cleanup_old_files())
-
-async def cleanup_old_files():
-    """Background task to clean up processed files older than 1 hour."""
+async def cleanup_old_files() -> None:
+    """Background task to clean up processed files and metadata older than 1 hour."""
     while True:
-        now = time.time()
-        for filename in os.listdir(PROCESSED_DIR):
-            file_path = os.path.join(PROCESSED_DIR, filename)
-            if os.path.isfile(file_path):
-                if os.stat(file_path).st_mtime < now - 3600:
+        try:
+            now = time.time()
+            # Clean up files and corresponding jobs_db entries
+            for filename in os.listdir(PROCESSED_DIR):
+                file_path = os.path.join(PROCESSED_DIR, filename)
+                if os.path.isfile(file_path):
                     try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"Failed to delete {file_path}: {e}")
-        await asyncio.sleep(600) # Check every 10 minutes
+                        file_stat = os.stat(file_path)
+                        if file_stat.st_mtime < now - FILE_EXPIRY_SEC:
+                            os.remove(file_path)
+                            logger.info(f"Deleted expired file: {file_path}")
+                            
+                            # Prune from jobs_db if job_id matches filename
+                            # Filename format: {job_id}.mp4
+                            job_id = filename.split('.')[0]
+                            if job_id in jobs_db:
+                                del jobs_db[job_id]
+                                logger.info(f"Pruned job {job_id} from jobs_db")
+                    except Exception:
+                        logger.exception(f"Failed to process/delete {file_path} during cleanup")
+            
+            # Also prune jobs_db entries that failed and are old
+            to_prune = []
+            for job_id, job in jobs_db.items():
+                if job.status == 'failed' and job.created_at < now - FILE_EXPIRY_SEC:
+                    to_prune.append(job_id)
+            
+            for job_id in to_prune:
+                del jobs_db[job_id]
+                logger.info(f"Pruned failed job {job_id} from jobs_db")
+                
+        except Exception:
+            logger.exception("Error in cleanup_old_files loop")
+            
+        await asyncio.sleep(CLEANUP_INTERVAL_SEC)
 
 @app.post("/upload")
 @limiter.limit("5/minute")
@@ -60,83 +105,124 @@ async def upload_video(
     mute: bool = Form(False),
     crop: str = Form("none"),
     start_time: float = Form(0.0),
-    end_time: float = Form(0.0)
-):
+    end_time: float = Form(0.0),
+    target_resolution: str = Form("original")
+) -> JSONResponse:
+    # Validate file type
+    if not video.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video.")
+
     job_id = str(uuid.uuid4())
-    input_filename = f"{job_id}_{video.filename}"
-    input_filepath = os.path.join(UPLOAD_DIR, input_filename)
+    file_extension = video.filename.split(".")[-1]
+    input_filename = f"{job_id}_input.{file_extension}"
+    output_filename = f"{job_id}.mp4"
     
-    # Read and enforce size limit
-    size_read = 0
+    input_path = os.path.join(UPLOAD_DIR, input_filename)
+    output_path = os.path.join(PROCESSED_DIR, output_filename)
+
     try:
-        with open(input_filepath, "wb") as f:
-            while chunk := await video.read(8192):
+        # Save uploaded file
+        size_read = 0
+        with open(input_path, "wb") as f:
+            while chunk := await video.read(1024 * 1024):
                 size_read += len(chunk)
                 if size_read > MAX_UPLOAD_SIZE:
-                    raise HTTPException(status_code=413, detail="File too large. Maximum size is 1GB.")
+                    raise HTTPException(status_code=413, detail="File too large. Maximum size is 2.5GB.")
                 f.write(chunk)
+                
+        # Create job object
+        options = VideoOptions(
+            target_size_mb=target_size_mb,
+            mute=mute,
+            crop=crop,
+            target_resolution=target_resolution,
+            start_time=start_time,
+            end_time=end_time
+        )
+        job = Job(
+            job_id=job_id,
+            input_file=input_path,
+            output_file=output_path,
+            options=options
+        )
+        
+        jobs_db[job_id] = job
+        await job_queue.put(job)
+        
+        return JSONResponse({"job_id": job_id})
+
     except HTTPException:
         # cleanup partial file
-        if os.path.exists(input_filepath):
-            os.remove(input_filepath)
+        if os.path.exists(input_path):
+            os.remove(input_path)
         raise
     except Exception as e:
-        if os.path.exists(input_filepath):
-            os.remove(input_filepath)
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        logger.exception("Upload failed")
         raise HTTPException(status_code=500, detail=str(e))
-        
-    output_filepath = os.path.join(PROCESSED_DIR, f"{job_id}_output.mp4")
-    
-    jobs_db[job_id] = {
-        "status": "queued",
-        "output_file": output_filepath,
-        "input_file": input_filepath,
-        "target_size_mb": target_size_mb,
-        "mute": mute,
-        "crop": crop,
-        "start_time": start_time,
-        "end_time": end_time
-    }
-    
-    await job_queue.put({
-        "job_id": job_id,
-        "input_file": input_filepath,
-        "output_file": output_filepath,
-        "target_size_mb": target_size_mb,
-        "mute": mute,
-        "crop": crop,
-        "start_time": start_time,
-        "end_time": end_time
-    })
-    
-    return {"job_id": job_id, "status": "queued"}
 
 @app.get("/status/{job_id}")
 @limiter.limit("30/minute")
-async def get_status(request: Request, job_id: str):
+async def get_status(request: Request, job_id: str) -> JSONResponse:
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"job_id": job_id, "status": jobs_db[job_id]["status"], "error": jobs_db[job_id].get("error")}
+    
+    job = jobs_db[job_id]
+    return JSONResponse(job.model_dump())
+
+@app.websocket("/ws/status/{job_id}")
+async def websocket_status(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    if job_id not in jobs_db:
+        await websocket.close(code=1008)  # Policy Violation / Not Found
+        return
+        
+    job = jobs_db[job_id]
+    last_status = None
+    
+    try:
+        while True:
+            # We check the memory db for status changes
+            if job.status != last_status:
+                last_status = job.status
+                await websocket.send_json(job.model_dump())
+                
+                # If job finished, we can close connection
+                if job.status in ["completed", "failed"]:
+                    break
+            await asyncio.sleep(0.5)
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for job: {job_id}")
+    except Exception as e:
+        logger.exception(f"Error in WebSocket status stream for job {job_id}: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 @app.get("/download/{job_id}")
 @limiter.limit("5/minute")
-async def download_video(request: Request, job_id: str):
+async def download_video(request: Request, job_id: str) -> FileResponse:
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
-        
+    
     job = jobs_db[job_id]
-    if job["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Job not completed yet")
-        
-    if not os.path.exists(job["output_file"]):
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Job not completed")
+    
+    if not os.path.exists(job.output_file):
         raise HTTPException(status_code=404, detail="Processed file not found")
-        
+
     return FileResponse(
-        path=job["output_file"],
+        job.output_file,
         filename=f"squashed_{job_id[:8]}.mp4",
         media_type="video/mp4"
     )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host=host, port=port, reload=True)

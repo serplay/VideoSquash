@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-python-multipart
-slowapi
-aiofiles
+fastapi>=0.115.0,<0.116.0
+uvicorn>=0.30.0,<0.31.0
+python-multipart>=0.0.9
+slowapi>=0.1.9
+websockets
