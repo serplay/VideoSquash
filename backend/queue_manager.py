@@ -24,12 +24,14 @@ async def worker(worker_id: int):
         job_id = job.job_id
         try:
             job.status = 'processing'
+            job.progress = 1.0
             logger.info(f"Worker {worker_id} picked up job {job_id}")
 
             # Process video
             await process_video(job)
 
             job.status = 'completed'
+            job.progress = 100.0
             logger.info(f"Worker {worker_id} completed job {job_id}")
 
         except Exception as e:

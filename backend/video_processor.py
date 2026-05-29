@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import logging
+from typing import Optional
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -12,6 +13,13 @@ BITRATE_SAFETY_FACTOR = 0.95
 DEFAULT_AUDIO_BITRATE_BPS = 128000
 
 from models import Job, VideoOptions
+
+
+def _update_job_progress(job: Job, phase_start: float, phase_end: float, current_seconds: float, total_seconds: float) -> None:
+    if total_seconds <= 0:
+        return
+    fraction = max(0.0, min(current_seconds / total_seconds, 1.0))
+    job.progress = round(phase_start + ((phase_end - phase_start) * fraction), 2)
 
 async def get_video_duration(input_file: str) -> float:
     """Uses ffprobe to extract the exact duration of the video in seconds."""
@@ -94,17 +102,37 @@ async def _build_video_filters(input_file: str, options: VideoOptions) -> list:
             
     return ['-vf', ','.join(vf_filters)] if vf_filters else []
 
-async def _run_ffmpeg_pass(cmd: list, pass_num: int):
+async def _run_ffmpeg_pass(cmd: list, pass_num: int, job: Job, phase_start: float, phase_end: float, total_seconds: float):
     """Internal helper to execute an ffmpeg pass."""
     logger.info(f"Starting ffmpeg pass {pass_num}")
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.DEVNULL
     )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        logger.error(f"ffmpeg pass {pass_num} failed: {stderr.decode()}")
+    if process.stdout is None:
+        raise Exception("Unable to read ffmpeg progress stream")
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        decoded = line.decode(errors='ignore').strip()
+        if '=' not in decoded:
+            continue
+        key, value = decoded.split('=', 1)
+        if key in {'out_time_ms', 'out_time_us'}:
+            try:
+                current_microseconds = float(value)
+                current_seconds = current_microseconds / 1_000_000.0
+                _update_job_progress(job, phase_start, phase_end, current_seconds, total_seconds)
+            except ValueError:
+                continue
+        elif key == 'progress' and value == 'end':
+            job.progress = phase_end
+
+    return_code = await process.wait()
+    if return_code != 0:
         raise Exception(f"ffmpeg pass {pass_num} error")
 
 async def process_video(job: Job):
@@ -142,30 +170,35 @@ async def process_video(job: Job):
         
     # --- Pass 1 ---
     job.status = 'pass_1'
+    job.progress = 5.0
         
     pass1_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
+        '-progress', 'pipe:1', '-nostats',
         '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
         '-pass', '1', '-passlogfile', pass_log_prefix, '-an'
     ] + compatibility_args + vf_args + ['-f', 'mp4', os.devnull]
     
     try:
-        await _run_ffmpeg_pass(pass1_cmd, 1)
+        await _run_ffmpeg_pass(pass1_cmd, 1, job, 5.0, 50.0, duration)
     except Exception as e:
         if use_nvenc and video_codec == "h264_nvenc":
             logger.warning("ffmpeg pass 1 failed with h264_nvenc. Falling back to CPU (libx264)...")
             video_codec = "libx264"
             pass1_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
+                '-progress', 'pipe:1', '-nostats',
                 '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
                 '-pass', '1', '-passlogfile', pass_log_prefix, '-an'
             ] + compatibility_args + vf_args + ['-f', 'mp4', os.devnull]
-            await _run_ffmpeg_pass(pass1_cmd, 1)
+            await _run_ffmpeg_pass(pass1_cmd, 1, job, 5.0, 50.0, duration)
         else:
             raise
     
     # --- Pass 2 ---
     job.status = 'pass_2'
+    job.progress = 50.0
         
     pass2_cmd = ['ffmpeg', '-y'] + input_args + ['-i', input_file,
+        '-progress', 'pipe:1', '-nostats',
         '-c:v', video_codec, '-b:v', f'{video_bitrate_kbps}k',
         '-pass', '2', '-passlogfile', pass_log_prefix
     ] + compatibility_args
@@ -177,7 +210,8 @@ async def process_video(job: Job):
     pass2_cmd.extend(vf_args)
     pass2_cmd.append(output_file)
     
-    await _run_ffmpeg_pass(pass2_cmd, 2)
+    await _run_ffmpeg_pass(pass2_cmd, 2, job, 50.0, 100.0, duration)
+    job.progress = 100.0
     
     # Cleanup log files
     for suffix in ['-0.log', '-0.log.mbtree']:

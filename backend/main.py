@@ -200,18 +200,20 @@ async def websocket_status(websocket: WebSocket, job_id: str):
         
     job = jobs_db[job_id]
     last_status = None
+    last_progress = None
     
     try:
         while True:
             # We check the memory db for status changes
-            if job.status != last_status:
+            if job.status != last_status or job.progress != last_progress:
                 last_status = job.status
+                last_progress = job.progress
                 await websocket.send_json(job.model_dump())
                 
                 # If job finished, we can close connection
                 if job.status in ["completed", "failed"]:
                     break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.25)
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for job: {job_id}")
     except Exception as e:

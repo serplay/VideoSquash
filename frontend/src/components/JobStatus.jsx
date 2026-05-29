@@ -1,7 +1,29 @@
 import React from 'react';
 
-export function JobStatus({ status, errorMsg, outputUrl, onReset }) {
+function formatSpeed(bytesPerSecond) {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return '0 B/s';
+  const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+  let value = bytesPerSecond;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatEta(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return 'Calculating...';
+  const clamped = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(clamped / 60);
+  const remaining = clamped % 60;
+  if (minutes <= 0) return `${remaining}s`;
+  return `${minutes}m ${remaining.toString().padStart(2, '0')}s`;
+}
+
+export function JobStatus({ status, errorMsg, outputUrl, progress = 0, uploadStatus, onReset }) {
   const getStatusText = () => {
+    if (uploadStatus?.active) return uploadStatus.label || 'Uploading video...';
     switch(status) {
       case 'queued': return 'Waiting in queue...';
       case 'pass_1': return 'Analyzing video (Pass 1/2)...';
@@ -16,11 +38,23 @@ export function JobStatus({ status, errorMsg, outputUrl, onReset }) {
   return (
     <div className="status-container">
       <h3>{getStatusText()}</h3>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginBottom: '0.5rem', color: 'var(--text-secondary)' }}>
+        <span>{uploadStatus?.active ? 'Uploading' : (status === 'completed' ? 'Done' : 'In progress')}</span>
+        <span>{Math.max(0, Math.min(100, Math.round(uploadStatus?.active ? uploadStatus.progress : progress)))}%</span>
+      </div>
+      {uploadStatus?.active && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginBottom: '0.75rem', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+          <span>{formatSpeed(uploadStatus.speedBps)}</span>
+          <span>ETA {formatEta(uploadStatus.etaSeconds)}</span>
+        </div>
+      )}
       
       {(status !== 'completed' && status !== 'error') && (
-        <div className="progress-bar">
-          <div className={`progress-fill ${status === 'processing' || status === 'pass_1' || status === 'pass_2' ? 'indeterminate' : ''}`} 
-               style={{width: status === 'queued' ? '10%' : '50%'}}></div>
+        <div className="progress-bar" aria-label="Compression progress">
+          <div 
+            className="progress-fill" 
+            style={{width: `${Math.max(0, Math.min(100, uploadStatus?.active ? uploadStatus.progress : progress))}%`}}
+          ></div>
         </div>
       )}
 
