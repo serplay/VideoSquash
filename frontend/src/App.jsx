@@ -25,6 +25,26 @@ function App() {
   const [outputUrl, setOutputUrl] = useState(null);
   const [localError, setLocalError] = useState('');
 
+  // Restore session from localStorage on mount
+  React.useEffect(() => {
+    try {
+      const raw = localStorage.getItem('videosquash_session');
+      if (raw) {
+        const sess = JSON.parse(raw);
+        if (sess.jobId) {
+          setJobId(sess.jobId);
+        }
+        if (typeof sess.autoDownload === 'boolean') setAutoDownload(sess.autoDownload);
+        if (sess.targetSize) setTargetSize(sess.targetSize);
+        if (sess.mute) setMute(sess.mute);
+        if (sess.crop) setCrop(sess.crop);
+        if (sess.targetResolution) setTargetResolution(sess.targetResolution);
+      }
+    } catch (err) {
+      console.warn('Failed to restore session:', err);
+    }
+  }, []);
+
   const onJobComplete = useCallback((data) => {
     const downloadUrl = `${API_BASE}/download/${data.job_id}`;
     setOutputUrl(downloadUrl);
@@ -40,6 +60,16 @@ function App() {
   }, [autoDownload]);
 
   const { status, setStatus, errorMsg, setErrorMsg } = useJobWebSocket(jobId, onJobComplete);
+
+  // Persist session whenever jobId or options change
+  React.useEffect(() => {
+    if (jobId) {
+      const sess = { jobId, autoDownload, targetSize, mute, crop, targetResolution, savedAt: Date.now() };
+      try { localStorage.setItem('videosquash_session', JSON.stringify(sess)); } catch (err) { console.warn('Failed to save session', err); }
+    } else {
+      try { localStorage.removeItem('videosquash_session'); } catch (err) {}
+    }
+  }, [jobId, autoDownload, targetSize, mute, crop, targetResolution]);
 
   const handleFileSelected = async (selectedFile) => {
     if (!selectedFile.type.startsWith('video/')) {
@@ -90,6 +120,8 @@ function App() {
 
       const data = await response.json();
       setJobId(data.job_id);
+      // persist immediately
+      try { localStorage.setItem('videosquash_session', JSON.stringify({ jobId: data.job_id, autoDownload, targetSize, mute, crop, targetResolution, savedAt: Date.now() })); } catch (err) {}
     } catch (err) {
       setStatus('error');
       setErrorMsg(err.message);
@@ -104,6 +136,7 @@ function App() {
     setStatus('idle');
     setLocalError('');
     setErrorMsg('');
+    try { localStorage.removeItem('videosquash_session'); } catch (err) {}
   };
 
   const isIdle = status === 'idle' || status === 'error';

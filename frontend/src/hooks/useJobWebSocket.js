@@ -27,7 +27,31 @@ export function useJobWebSocket(jobId, onComplete) {
       wsUrl = `${protocol}//${window.location.host}${formattedApiBase}/ws/status/${jobId}`;
     }
 
-    console.log('Connecting to WebSocket status stream:', wsUrl);
+    console.log('Checking current job status and connecting to WebSocket:', wsUrl);
+
+    // First fetch current status in case we missed updates (e.g., after reload)
+    (async () => {
+      try {
+        const statusResp = await fetch(wsUrl.replace('/ws/status/', '/status/'));
+        if (statusResp.ok) {
+          const data = await statusResp.json();
+          if (data.status === 'completed') {
+            setStatus('completed');
+            if (onCompleteRef.current) onCompleteRef.current(data);
+            return; // no need to open WS
+          } else if (data.status === 'failed') {
+            setStatus('error');
+            setErrorMsg(data.error || 'Processing failed');
+            return;
+          } else {
+            setStatus(data.status);
+          }
+        }
+      } catch (err) {
+        console.warn('Could not fetch initial status:', err);
+      }
+    })();
+
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (event) => {

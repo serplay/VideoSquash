@@ -13,9 +13,13 @@ from slowapi.errors import RateLimitExceeded
 from queue_manager import job_queue, jobs_db, start_workers
 from models import Job, VideoOptions
 
-# Configure logging centrally
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Configure logging centrally with level from environment
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("videosquash")
+
+# FastAPI will still log via uvicorn; ensure uvicorn picks up our level
+uvicorn_log_level = LOG_LEVEL.lower() if 'uvicorn_log_level' not in globals() else globals()['uvicorn_log_level']
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +40,22 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import PlainTextResponse
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning(f"Validation error for request {request.url}: {exc}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Log the full exception server-side, but return a safe message to clients
+    logger.exception(f"Unhandled exception for request {request.url}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # CORS configuration
 app.add_middleware(
@@ -225,4 +245,4 @@ if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+    uvicorn.run("main:app", host=host, port=port, reload=True, log_level=uvicorn_log_level)
