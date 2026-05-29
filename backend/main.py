@@ -71,6 +71,7 @@ PROCESSED_DIR = "processed"
 # File size limits and intervals
 GB = 1024 * 1024 * 1024
 MAX_UPLOAD_SIZE = 2.5 * GB
+MIN_CLIP_DURATION_SEC = 1.0
 CLEANUP_INTERVAL_SEC = 600
 FILE_EXPIRY_SEC = 3600
 
@@ -131,6 +132,9 @@ async def upload_video(
     # Validate file type
     if not video.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video.")
+
+    if end_time > 0 and start_time >= 0 and end_time - start_time < MIN_CLIP_DURATION_SEC:
+        raise HTTPException(status_code=400, detail="Trimmed video must be at least 1 second long.")
 
     job_id = str(uuid.uuid4())
     file_extension = video.filename.split(".")[-1]

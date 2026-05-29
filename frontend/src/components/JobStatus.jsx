@@ -73,7 +73,7 @@ export function JobStatus({ status, errorMsg, outputUrl, progress = 0, uploadSta
       {(status === 'completed' || status === 'error') && (
         <button 
           onClick={onReset}
-          style={{ marginTop: '1rem', width: '100%', background: 'transparent', border: '1px solid var(--border-color)'}}
+          style={{ marginTop: '1rem', width: '100%', background: '#3a3a3a', color: 'var(--text-color)', border: '1px solid #555' }}
         >
           Compress Another Video
         </button>

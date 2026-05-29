@@ -16,6 +16,8 @@ function App() {
   
   // Compression options
   const [targetSize, setTargetSize] = useState('25');
+  const [startTime, setStartTime] = useState(0);
+  const [endTime, setEndTime] = useState(0);
   const [mute, setMute] = useState(false);
   const [crop, setCrop] = useState('none');
   const [targetResolution, setTargetResolution] = useState('original');
@@ -43,6 +45,8 @@ function App() {
         const sess = JSON.parse(raw);
         if (typeof sess.autoDownload === 'boolean') setAutoDownload(sess.autoDownload);
         if (sess.targetSize) setTargetSize(sess.targetSize);
+        if (typeof sess.startTime === 'number') setStartTime(sess.startTime);
+        if (typeof sess.endTime === 'number') setEndTime(sess.endTime);
         if (sess.mute) setMute(sess.mute);
         if (sess.crop) setCrop(sess.crop);
         if (sess.targetResolution) setTargetResolution(sess.targetResolution);
@@ -90,12 +94,12 @@ function App() {
   // Persist session whenever jobId or options change
   React.useEffect(() => {
     if (jobId) {
-      const sess = { jobId, autoDownload, targetSize, mute, crop, targetResolution, savedAt: Date.now() };
+      const sess = { jobId, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution, savedAt: Date.now() };
       try { localStorage.setItem('videosquash_session', JSON.stringify(sess)); } catch (err) { console.warn('Failed to save session', err); }
     } else {
       try { localStorage.removeItem('videosquash_session'); } catch (err) {}
     }
-  }, [jobId, autoDownload, targetSize, mute, crop, targetResolution]);
+  }, [jobId, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution]);
 
   const handleFileSelected = async (selectedFile) => {
     if (!selectedFile.type.startsWith('video/')) {
@@ -118,6 +122,8 @@ function App() {
         // Suggest target size as 50% of original
         const originalSizeMB = selectedFile.size / (1024 * 1024);
         setTargetSize((originalSizeMB * 0.5).toFixed(1));
+        setStartTime(0);
+        setEndTime(meta.duration || 0);
       }
     } catch (err) {
       setLocalError('Error reading video metadata.');
@@ -144,6 +150,8 @@ function App() {
     formData.append('target_size_mb', targetSize);
     formData.append('mute', mute);
     formData.append('crop', crop);
+    formData.append('start_time', startTime);
+    formData.append('end_time', Number.isFinite(endTime) && endTime > 0 ? endTime : (metadata.duration || 0));
     formData.append('target_resolution', targetResolution);
 
     try {
@@ -209,7 +217,7 @@ function App() {
 
       setJobId(data.job_id);
       // persist immediately
-      try { localStorage.setItem('videosquash_session', JSON.stringify({ jobId: data.job_id, autoDownload, targetSize, mute, crop, targetResolution, savedAt: Date.now() })); } catch (err) {}
+      try { localStorage.setItem('videosquash_session', JSON.stringify({ jobId: data.job_id, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution, savedAt: Date.now() })); } catch (err) {}
     } catch (err) {
       setUploadStatus({
         active: false,
@@ -255,8 +263,13 @@ function App() {
         {file && isIdle && (
           <CompressionForm 
             file={file}
+            duration={metadata.duration}
             targetSize={targetSize}
             setTargetSize={setTargetSize}
+            startTime={startTime}
+            setStartTime={setStartTime}
+            endTime={endTime}
+            setEndTime={setEndTime}
             mute={mute}
             setMute={setMute}
             crop={crop}
