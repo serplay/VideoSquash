@@ -1,5 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import './index.css';
+import { FluidBackground } from './components/FluidBackground';
 import { useVideoMetadata } from './hooks/useVideoMetadata';
 import { useJobWebSocket } from './hooks/useJobWebSocket';
 import { UploadZone } from './components/UploadZone';
@@ -249,7 +250,9 @@ function App() {
   const displayError = localError || (status === 'error' ? errorMsg : '');
 
   return (
-    <div className="app-container">
+    <>
+      <FluidBackground />
+      <div className="app-container">
       <header>
         <h1>VideoSquash</h1>
         <p className="subtitle">Strictly minimal video compression</p>
@@ -298,7 +301,8 @@ function App() {
           <div className="error-message" style={{ marginBottom: '1rem' }}>{displayError}</div>
         )}
       </main>
-    </div>
+      </div>
+    </>
   );
 }
 
