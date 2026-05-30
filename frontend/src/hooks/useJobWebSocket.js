@@ -18,15 +18,19 @@ export function useJobWebSocket(jobId, onComplete) {
     setErrorMsg('');
     setProgress(0);
 
-    // Construct WebSocket URL based on VITE_API_BASE
+    // Construct separate HTTP and WebSocket URLs based on VITE_API_BASE
     let apiBase = import.meta.env.VITE_API_BASE || '/api';
     let wsUrl;
+    let statusUrl;
     if (apiBase.startsWith('http')) {
       wsUrl = apiBase.replace(/^http/, 'ws') + `/ws/status/${jobId}`;
+      statusUrl = `${apiBase}/status/${jobId}`;
     } else {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const httpProtocol = window.location.protocol;
       const formattedApiBase = apiBase.startsWith('/') ? apiBase : '/' + apiBase;
       wsUrl = `${protocol}//${window.location.host}${formattedApiBase}/ws/status/${jobId}`;
+      statusUrl = `${httpProtocol}//${window.location.host}${formattedApiBase}/status/${jobId}`;
     }
 
     console.log('Checking current job status and connecting to WebSocket:', wsUrl);
@@ -48,7 +52,7 @@ export function useJobWebSocket(jobId, onComplete) {
     // First fetch current status in case we missed updates (e.g., after reload)
     (async () => {
       try {
-        const statusResp = await fetch(wsUrl.replace('/ws/status/', '/status/'));
+        const statusResp = await fetch(statusUrl);
         if (!statusResp.ok) {
           if (statusResp.status === 404) {
             markStaleJob();

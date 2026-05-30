@@ -41,6 +41,11 @@ app = FastAPI(lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Keep basic abuse protection, but allow normal retry/testing flows without tripping 429s.
+UPLOAD_RATE_LIMIT = os.getenv("UPLOAD_RATE_LIMIT", "20/minute")
+STATUS_RATE_LIMIT = os.getenv("STATUS_RATE_LIMIT", "60/minute")
+DOWNLOAD_RATE_LIMIT = os.getenv("DOWNLOAD_RATE_LIMIT", "20/minute")
+
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import PlainTextResponse
 
@@ -118,7 +123,7 @@ async def cleanup_old_files() -> None:
         await asyncio.sleep(CLEANUP_INTERVAL_SEC)
 
 @app.post("/upload")
-@limiter.limit("5/minute")
+@limiter.limit(UPLOAD_RATE_LIMIT)
 async def upload_video(
     request: Request,
     video: UploadFile = File(...),
@@ -187,7 +192,7 @@ async def upload_video(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status/{job_id}")
-@limiter.limit("30/minute")
+@limiter.limit(STATUS_RATE_LIMIT)
 async def get_status(request: Request, job_id: str) -> JSONResponse:
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -229,7 +234,7 @@ async def websocket_status(websocket: WebSocket, job_id: str):
             pass
 
 @app.get("/download/{job_id}")
-@limiter.limit("5/minute")
+@limiter.limit(DOWNLOAD_RATE_LIMIT)
 async def download_video(request: Request, job_id: str) -> FileResponse:
     if job_id not in jobs_db:
         raise HTTPException(status_code=404, detail="Job not found")
