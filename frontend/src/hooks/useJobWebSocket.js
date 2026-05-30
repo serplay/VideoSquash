@@ -33,30 +33,53 @@ export function useJobWebSocket(jobId, onComplete) {
 
     let ws = null;
     let cancelled = false;
+    let terminalStateReached = false;
+
+    const markStaleJob = () => {
+      if (cancelled) return;
+      setStatus('error');
+      setProgress(0);
+      setErrorMsg('This job is no longer available. Please upload a new video.');
+      try {
+        localStorage.removeItem('videosquash_session');
+      } catch (err) {}
+    };
 
     // First fetch current status in case we missed updates (e.g., after reload)
     (async () => {
       try {
         const statusResp = await fetch(wsUrl.replace('/ws/status/', '/status/'));
-        if (statusResp.ok) {
-          const data = await statusResp.json();
-          if (cancelled) return;
-          setProgress(typeof data.progress === 'number' ? data.progress : 0);
-          if (data.status === 'completed') {
-            setStatus('completed');
-            setProgress(100);
-            if (onCompleteRef.current) onCompleteRef.current(data);
+        if (!statusResp.ok) {
+          if (statusResp.status === 404) {
+            markStaleJob();
             return;
-          } else if (data.status === 'failed') {
-            setStatus('error');
-            setErrorMsg(data.error || 'Processing failed');
-            return;
-          } else {
-            setStatus(data.status);
           }
+          throw new Error(`Status request failed with ${statusResp.status}`);
+        }
+
+        const data = await statusResp.json();
+        if (cancelled) return;
+        setProgress(typeof data.progress === 'number' ? data.progress : 0);
+        if (data.status === 'completed') {
+          terminalStateReached = true;
+          setStatus('completed');
+          setProgress(100);
+          if (onCompleteRef.current) onCompleteRef.current(data);
+          return;
+        } else if (data.status === 'failed') {
+          terminalStateReached = true;
+          setStatus('error');
+          setErrorMsg(data.error || 'Processing failed');
+          return;
+        } else {
+          setStatus(data.status);
         }
       } catch (err) {
         console.warn('Could not fetch initial status:', err);
+        if (!cancelled) {
+          markStaleJob();
+        }
+        return;
       }
       if (cancelled) return;
 
@@ -70,11 +93,13 @@ export function useJobWebSocket(jobId, onComplete) {
             setProgress(data.progress);
           }
           if (data.status === 'completed') {
+            terminalStateReached = true;
             setStatus('completed');
             setProgress(100);
             if (onCompleteRef.current) onCompleteRef.current(data);
             ws.close();
           } else if (data.status === 'failed') {
+            terminalStateReached = true;
             setStatus('error');
             setErrorMsg(data.error || 'Processing failed');
             ws.close();
@@ -94,6 +119,9 @@ export function useJobWebSocket(jobId, onComplete) {
 
       ws.onclose = (event) => {
         console.log('WebSocket closed:', event.code, event.reason);
+        if (!terminalStateReached && event.code === 1008) {
+          markStaleJob();
+        }
       };
     })();
 

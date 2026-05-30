@@ -94,13 +94,13 @@ function App() {
 
   // Persist session whenever jobId or options change
   React.useEffect(() => {
-    if (jobId) {
+    if (jobId && status !== 'completed' && status !== 'error') {
       const sess = { jobId, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution, savedAt: Date.now() };
       try { localStorage.setItem('videosquash_session', JSON.stringify(sess)); } catch (err) { console.warn('Failed to save session', err); }
     } else {
       try { localStorage.removeItem('videosquash_session'); } catch (err) {}
     }
-  }, [jobId, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution]);
+  }, [jobId, status, autoDownload, targetSize, startTime, endTime, mute, crop, targetResolution]);
 
   const handleFileSelected = async (selectedFile) => {
     if (!selectedFile.type.startsWith('video/')) {
