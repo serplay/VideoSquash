@@ -255,7 +255,7 @@ function App() {
       <div className="app-container">
       <header>
         <h1>VideoSquash</h1>
-        <p className="subtitle">Strictly minimal video compression</p>
+        <p className="subtitle">Compress to (almost) any size</p>
       </header>
 
       <main>
