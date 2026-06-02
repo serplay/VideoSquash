@@ -25,6 +25,8 @@ SOFTWARE.
 
 "use strict";
 
+import config from "./config.json";
+
 // Simulation section
 
 function resizeCanvas() {
@@ -46,16 +48,8 @@ function scaleByPixelRatio(input) {
 const canvas = document.getElementsByTagName("canvas")[0];
 resizeCanvas();
 
-// Set the properties from the config file
-fetch(new URL("./config.json", import.meta.url))
-  .then((response) => response.json())
-  .then((config) => {
-    runSimulation(config);
-  })
-  .catch((error) => {
-    // Handle errors if the config fails to load
-    alert("Failed to load config. Check the file or network.");
-  });
+// Use the bundled JSON config (imported by Vite)
+runSimulation(config);
 
 function runSimulation(config) {
   function pointerPrototype() {
